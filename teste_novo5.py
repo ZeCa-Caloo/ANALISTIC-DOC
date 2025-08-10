@@ -486,8 +486,8 @@ def _header_footer(canvas, doc):
     try:
         logo_path = "brasao.png"
         if os.path.exists(logo_path):
-            img_w = 40 * mm      # largura do brasão
-            img_h = 40 * mm      # altura do brasão
+            img_w = 70 * mm      # largura do brasão
+            img_h = 80 * mm      # altura do brasão
             x = (largura_pagina - img_w) / 2.0
             y = altura_pagina - (img_h + 10 * mm)  # topo do brasão a 10 mm do topo da página
             canvas.drawImage(logo_path, x, y, width=img_w, height=img_h,
@@ -890,3 +890,4 @@ if uploaded_files:
 
     else:
         st.warning("Nenhum dado válido encontrado.")
+
