@@ -5,3 +5,6 @@ plotly
 openpyxl
 chardet
 pytz
+python-docx
+reportlab
+beautifulsoup4
