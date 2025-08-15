@@ -10,6 +10,9 @@ import base64
 import textwrap
 from datetime import datetime
 import os
+import re
+import hashlib
+import json
 
 # ====== (opcional) DOCX ======
 try:
@@ -49,6 +52,90 @@ def _decode_file(uploaded_file) -> str:
         uploaded_file.seek(0)
     return text
 
+# ---------- HASH (SHA-512) ----------
+def gerar_hash(conteudo_bytes: bytes, algoritmo: str = "sha512") -> str:
+    h = hashlib.new(algoritmo)
+    h.update(conteudo_bytes)
+    return h.hexdigest()
+
+# ---------- Sanitizador para WhatsApp Business Record ----------
+def _sanitize_wa_value(value: str, key_en: str) -> str:
+    v = value or ""
+    v = re.sub(r"(WhatsApp\s+Business\s+Record\s+Page\s*\d+|Página\s*\d+)", "", v, flags=re.I)
+    v = re.sub(r"\s{2,}", " ", v).strip()
+    if key_en == "ip addresses definition":
+        cut_tokens = ["IP Addresses:", "Ip Addresses", "IP Address", "Time 20", "Time 19"]
+        for tok in cut_tokens:
+            idx = v.find(tok)
+            if idx != -1:
+                v = v[:idx].strip()
+                break
+    m = re.search(r"\b20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+UTC\b", v)
+    if m:
+        v = v[:m.start()].strip()
+    return v
+
+def _parse_whatsapp_business_record(text: str) -> dict | None:
+    soup = BeautifulSoup(text, "html.parser")
+    plain = soup.get_text(separator="\n")
+    lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
+    lower_lines = [ln.lower() for ln in lines]
+
+    keys_en = [
+        "service",
+        "account identifier",
+        "account type",
+        "generated",
+        "date range",
+        "ncmec reports definition",
+        "ncmec cybertips",
+        "emails definition",
+        "registered email addresses",
+        "ip addresses definition",
+    ]
+    map_pt = {
+        "service": "Serviço",
+        "account identifier": "Identificador da Conta",
+        "account type": "Tipo de Conta",
+        "generated": "Gerado em",
+        "date range": "Intervalo de Datas",
+        "ncmec reports definition": "Definição – Relatórios NCMEC",
+        "ncmec cybertips": "NCMEC CyberTips",
+        "emails definition": "Definição – E-mails",
+        "registered email addresses": "E-mails Cadastrados",
+        "ip addresses definition": "Definição – Endereços IP",
+    }
+
+    idxs = {}
+    for i, ll in enumerate(lower_lines):
+        for k in keys_en:
+            if ll == k and k not in idxs:
+                idxs[k] = i
+
+    if "service" not in idxs:
+        return None
+
+    result = {}
+    for pos, k in enumerate(keys_en):
+        if k not in idxs:
+            continue
+        start = idxs[k] + 1
+        next_idx = None
+        for j in range(pos + 1, len(keys_en)):
+            if keys_en[j] in idxs:
+                next_idx = idxs[keys_en[j]]
+                break
+        end = next_idx if next_idx is not None else len(lines)
+
+        chunk = lines[start:end]
+        chunk = [c for c in chunk if c.lower() not in keys_en]
+        value = " ".join(chunk).strip()
+        value = _sanitize_wa_value(value, k)
+        if value:
+            result[map_pt[k]] = value
+
+    return result or None
+
 def _parse_text_time_ip(text: str) -> pd.DataFrame | None:
     soup = BeautifulSoup(text, "html.parser")
     plain = soup.get_text(separator="\n")
@@ -67,23 +154,20 @@ def _parse_text_time_ip(text: str) -> pd.DataFrame | None:
             while j < n and not clean[j]:
                 j += 1
             if j < n:
-                current["Time"] = clean[j]
-                i = j
+                current["Time"] = clean[j]; i = j
         elif token.lower() in ("ip address", "ip addresses"):
             j = i + 1
             while j < n and not clean[j]:
                 j += 1
             if j < n:
-                current["IP Address"] = clean[j]
-                i = j
+                current["IP Address"] = clean[j]; i = j
         else:
             if token.lower() in ("ip addresses", "ipaddress", "ip"):
                 j = i + 1
                 while j < n and not clean[j]:
                     j += 1
                 if j < n:
-                    current["IP Address"] = clean[j]
-                    i = j
+                    current["IP Address"] = clean[j]; i = j
 
         if current["Time"] and current["IP Address"]:
             records.append({"Time": current["Time"], "IP Address": current["IP Address"]})
@@ -126,6 +210,14 @@ def ler_arquivo(uploaded_file):
     elif ext in ("html", "htm", "txt"):
         try:
             text = _decode_file(uploaded_file)
+
+            # Detecta e guarda o resumo do WhatsApp Business Record (para o relatório)
+            try:
+                wa_doc = _parse_whatsapp_business_record(text)
+                if wa_doc:
+                    st.session_state["wa_doc"] = wa_doc
+            except Exception:
+                pass
 
             soup = BeautifulSoup(text, "html.parser")
             if soup.find("table"):
@@ -232,18 +324,15 @@ def formatar_datas_para_exibicao(df):
     return df_exibir
 
 # ====== Relatório: detecção de colunas e tabelas ======
-
 def _guess_colunas(df):
     col_tempo = None
     for c in df.columns:
         if str(c).strip().lower() == "time":
-            col_tempo = c
-            break
+            col_tempo = c; break
     if col_tempo is None:
         for c in df.columns:
             if pd.api.types.is_datetime64_any_dtype(df[c]):
-                col_tempo = c
-                break
+                col_tempo = c; break
     if col_tempo is None:
         candidatos_tempo = [c for c in df.columns if str(c).strip().lower() in
                             ("timestamp","data","datetime","date","hora","data/hora")]
@@ -251,16 +340,14 @@ def _guess_colunas(df):
             try:
                 test = pd.to_datetime(df[cand], errors="coerce", utc=True)
                 if test.notna().any():
-                    col_tempo = cand
-                    break
+                    col_tempo = cand; break
             except Exception:
                 pass
 
     col_ip = None
     for c in df.columns:
         if str(c).strip().lower() == "ip address":
-            col_ip = c
-            break
+            col_ip = c; break
     if col_ip is None:
         candidatos_ip = [c for c in df.columns if "ip" in str(c).lower()]
         if candidatos_ip:
@@ -276,8 +363,7 @@ def _fig_to_png_bytes(fig):
     return buf.getvalue()
 
 def _grafico_timeline(df, col_tempo):
-    serie = pd.to_datetime(df[col_tempo], errors="coerce")
-    serie = serie.dropna()
+    serie = pd.to_datetime(df[col_tempo], errors="coerce").dropna()
     if serie.empty:
         return None
     por_dia = serie.dt.date.value_counts().sort_index()
@@ -317,213 +403,20 @@ def montar_tabela_ip_time_completa(df: pd.DataFrame) -> pd.DataFrame:
     base = df[[col_tempo, col_ip]].copy()
 
     try:
-        serie = pd.to_datetime(base[col_tempo], errors="coerce", utc=True)
-        serie = serie.dt.tz_convert("America/Sao_Paulo")
+        serie = pd.to_datetime(base[col_tempo], errors="coerce", utc=True).dt.tz_convert("America/Sao_Paulo")
     except Exception:
         serie = pd.to_datetime(base[col_tempo], errors="coerce")
         if getattr(serie.dt, "tz", None) is None:
             serie = serie.dt.tz_localize("America/Sao_Paulo")
 
     base["__time"] = serie
-    base = base.dropna(subset=["__time", col_ip])
-
-    base = base.sort_values("__time", ascending=False)
-
+    base = base.dropna(subset=["__time", col_ip]).sort_values("__time", ascending=False)
     base["Time (America/Sao_Paulo)"] = base["__time"].dt.strftime("%d/%m/%Y %H:%M:%S")
-    base = base[["Time (America/Sao_Paulo)", col_ip]]
-    base = base.rename(columns={col_ip: "IP Address"})
+    base = base[["Time (America/Sao_Paulo)", col_ip]].rename(columns={col_ip: "IP Address"})
     return base.reset_index(drop=True)
 
-def gerar_relatorio_html_txt_docx(df_base: pd.DataFrame,
-                                  df_filtrado: pd.DataFrame,
-                                  incluir_graficos: bool,
-                                  metadados: dict):
-    df = df_filtrado if df_filtrado is not None and not df_filtrado.empty else df_base.copy()
-
-    col_tempo, col_ip = _guess_colunas(df)
-
-    periodo_txt = "Não identificado"
-    if col_tempo and col_tempo in df.columns:
-        try:
-            serie = pd.to_datetime(df[col_tempo], errors="coerce", utc=True)
-            if getattr(serie.dt, "tz", None) is not None:
-                serie = serie.dt.tz_convert("America/Sao_Paulo")
-            else:
-                serie = serie.dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
-            tmin, tmax = serie.min(), serie.max()
-            if pd.notna(tmin) and pd.notna(tmax):
-                periodo_txt = f"{tmin.strftime('%d/%m/%Y %H:%M:%S')} a {tmax.strftime('%d/%m/%Y %H:%M:%S')}"
-        except Exception:
-            pass
-
-    achados = []
-    achados.append(f"Total de registros analisados: {len(df)}.")
-    achados.append(f"Total de colunas: {df.shape[1]} ({', '.join(map(str, df.columns))}).")
-    achados.append(f"Período coberto (se aplicável): {periodo_txt}.")
-    if col_ip and col_ip in df.columns:
-        ips_unicos = df[col_ip].astype(str).nunique(dropna=True)
-        achados.append(f"Endereços IP distintos identificados: {ips_unicos}.")
-        top_ips = df[col_ip].astype(str).value_counts().head(5)
-        if not top_ips.empty:
-            resumo_top = "; ".join([f"{idx} ({val})" for idx, val in top_ips.items()])
-            achados.append(f"Principais IPs por frequência: {resumo_top}.")
-    else:
-        achados.append("Não foi identificada coluna de IP.")
-
-    png_timeline = _grafico_timeline(df, col_tempo) if incluir_graficos and col_tempo else None
-    png_top_ips = _grafico_top_ips(df, col_ip) if incluir_graficos and col_ip else None
-
-    tabela_completa = montar_tabela_ip_time_completa(df)
-
-    html_parts = []
-    html_parts.append("<meta charset='utf-8'>")
-    html_parts.append("<style>body{font-family:Arial,Helvetica,sans-serif;margin:24px} h1,h2{margin:0.2em 0} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:6px;font-size:13px} .muted{color:#555} .blk{margin:18px 0}</style>")
-    html_parts.append("<h1>Relatório Policial - Análise de IPs (Análise de Dados)</h1>")
-    html_parts.append("<div class='blk'><h2>Metadados</h2><table>")
-    for k,v in metadados.items():
-        html_parts.append(f"<tr><th style='width:260px;text-align:left'>{k}</th><td>{v}</td></tr>")
-    html_parts.append("</table></div>")
-    html_parts.append("<div class='blk'><h2>Síntese dos Achados</h2><ul>")
-    for a in achados:
-        html_parts.append(f"<li>{a}</li>")
-    html_parts.append("</ul></div>")
-    html_parts.append("<div class='blk'><h2>Metodologia</h2>")
-    html_parts.append("<p class='muted'>Os dados foram importados, higienizados e analisados com apoio de ferramentas computacionais. Procedeu-se à consolidação de múltiplas fontes, conversão de datas para o fuso America/Sao_Paulo e análise descritiva (contagens, modos e médias).</p></div>")
-
-    if incluir_graficos and (png_timeline or png_top_ips):
-        html_parts.append("<div class='blk'><h2>Gráficos</h2>")
-        if png_timeline:
-            html_parts.append("<h3>Linha do tempo de eventos por dia</h3>")
-            html_parts.append(f"<img src='{_png_data_uri(png_timeline)}' style='max-width:100%;height:auto'/>")
-        if png_top_ips:
-            html_parts.append("<h3>Top IPs por frequência</h3>")
-            html_parts.append(f"<img src='{_png_data_uri(png_top_ips)}' style='max-width:100%;height:auto'/>")
-        html_parts.append("</div>")
-
-    html_parts.append("<div class='blk'><h2>Tabela Completa: IP Address × Time (mais recentes primeiro)</h2>")
-    if tabela_completa.empty:
-        html_parts.append("<p class='muted'>Não há dados suficientes para compor a tabela completa (verifique colunas de IP e horário).</p>")
-    else:
-        html_parts.append(tabela_completa.to_html(index=False))
-    html_parts.append("</div>")
-
-    html_bytes = "\n".join(html_parts).encode("utf-8")
-
-    linhas = []
-    linhas.append("RELATÓRIO POLICIAL (ANÁLISE DE DADOS)")
-    linhas.append("=" * 60)
-    for k,v in metadados.items():
-        linhas.append(f"{k}: {v}")
-    linhas.append("")
-    linhas.append("1. SÍNTESE DOS ACHADOS")
-    for linha in achados:
-        linhas.append(f"- {linha}")
-    linhas.append("")
-    linhas.append("2. METODOLOGIA")
-    linhas.append(textwrap.fill(
-        "Os dados foram importados, higienizados e analisados com apoio de ferramentas "
-        "computacionais. Procedeu-se à consolidação de múltiplas fontes, conversão de datas "
-        "para o fuso America/Sao_Paulo e análise descritiva (contagens, modos e médias).",
-        width=100
-    ))
-    txt_bytes = "\n".join(linhas).encode("utf-8")
-
-    docx_bytes = None
-    if DOCX_OK:
-        doc = Document()
-        doc.add_heading('Relatório Policial - Análise de IPs (Análise de Dados)', level=1)
-
-        doc.add_heading('Metadados', level=2)
-        for k,v in metadados.items():
-            doc.add_paragraph(f"{k}: {v}")
-
-        doc.add_heading('Síntese dos Achados', level=2)
-        for a in achados:
-            doc.add_paragraph(a)
-
-        doc.add_heading('Metodologia', level=2)
-        doc.add_paragraph(
-            "Os dados foram importados, higienizados e analisados com apoio de ferramentas computacionais. "
-            "Procedeu-se à consolidação de múltiplas fontes, conversão de datas para o fuso America/Sao_Paulo "
-            "e análise descritiva (contagens, modos e médias)."
-        )
-
-        if incluir_graficos and (png_timeline or png_top_ips):
-            doc.add_heading('Gráficos', level=2)
-            if png_timeline:
-                doc.add_paragraph("Linha do tempo de eventos por dia")
-                stream = BytesIO(png_timeline); stream.seek(0)
-                doc.add_picture(stream, width=Inches(6.0))
-            if png_top_ips:
-                doc.add_paragraph("Top IPs por frequência")
-                stream = BytesIO(png_top_ips); stream.seek(0)
-                doc.add_picture(stream, width=Inches(6.0))
-
-        doc.add_heading('Tabela Completa: IP Address × Time (mais recentes primeiro)', level=2)
-        tabela = montar_tabela_ip_time_completa(df)
-        if tabela.empty:
-            doc.add_paragraph("Não há dados suficientes para compor a tabela completa (verifique colunas de IP e horário).")
-        else:
-            cols = ["Time (America/Sao_Paulo)", "IP Address"]
-            t = doc.add_table(rows=1, cols=len(cols))
-            hdr = t.rows[0].cells
-            for i, c in enumerate(cols):
-                hdr[i].text = c
-            for _, row in tabela.iterrows():
-                cells = t.add_row().cells
-                cells[0].text = str(row["Time (America/Sao_Paulo)"])
-                cells[1].text = str(row["IP Address"])
-
-        bio = BytesIO()
-        doc.save(bio); bio.seek(0)
-        docx_bytes = bio.getvalue()
-
-    return {"html": html_bytes, "txt": txt_bytes, "docx": docx_bytes}
-
-# ---- PDF: brasão + numeração + gráficos; título 2 cm abaixo do brasão (via topMargin) ----
-def _header_footer(canvas, doc):
-    largura_pagina, altura_pagina = A4
-    try:
-        logo_path = "brasao.png"
-        if os.path.exists(logo_path):
-            img_w = 70 * mm      # largura do brasão
-            img_h = 70 * mm      # altura do brasão
-            x = (largura_pagina - img_w) / 2.5
-            y = altura_pagina - (img_h + 10 * mm)  # topo do brasão a 10 mm do topo da página
-            canvas.drawImage(logo_path, x, y, width=img_w, height=img_h,
-                             preserveAspectRatio=True, mask='auto')
-    except Exception:
-        pass
-    # Rodapé com numeração
-    page_num = canvas.getPageNumber()
-    canvas.setFont("Helvetica", 9)
-    canvas.setFillColor(colors.grey)
-    canvas.drawRightString(largura_pagina - 20 * mm, 12 * mm, f"Página {page_num}")
-
-def _rl_image_from_png_bytes(png_bytes: bytes, max_width_pt: float, max_height_pt: float):
-    try:
-        bio = BytesIO(png_bytes)
-        ir = ImageReader(bio)
-        iw, ih = ir.getSize()
-        scale = min(max_width_pt / float(iw), max_height_pt / float(ih), 1.0)
-        w = iw * scale
-        h = ih * scale
-        bio.seek(0)
-        return Image(bio, width=w, height=h)
-    except Exception:
-        return None
-
-def gerar_relatorio_pdf(df_base: pd.DataFrame,
-                        df_filtrado: pd.DataFrame,
-                        incluir_graficos: bool,
-                        metadados: dict,
-                        titulo: str = "Relatório Policial - Análise de IPs") -> bytes:
-    if not PDF_OK:
-        raise RuntimeError("Pacote 'reportlab' não está disponível. Instale com: pip install reportlab")
-
-    df = df_filtrado if df_filtrado is not None and not df_filtrado.empty else df_base.copy()
-    col_tempo, col_ip = _guess_colunas(df)
-
+# ---------- bloco comum para texto/achados ----------
+def _resumo_achados(df, col_tempo, col_ip):
     periodo_txt = "Não identificado"
     if col_tempo and col_tempo in df.columns:
         try:
@@ -552,19 +445,235 @@ def gerar_relatorio_pdf(df_base: pd.DataFrame,
             achados.append(f"Principais IPs por frequência: {resumo_top}.")
     else:
         achados.append("Não foi identificada coluna de IP.")
+    return periodo_txt, achados
+
+def _payload_para_hash_conteudo(metadados: dict, wa_doc: dict | None, df: pd.DataFrame, periodo_txt: str) -> bytes:
+    payload = {
+        "metadados": metadados,
+        "wa_doc": wa_doc or {},
+        "periodo": periodo_txt,
+        "colunas": list(map(str, df.columns)),
+        "registros": int(len(df)),
+        "gerado_em": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "versao_layout": 2,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+def gerar_relatorio_html_txt_docx(df_base: pd.DataFrame,
+                                  df_filtrado: pd.DataFrame,
+                                  incluir_graficos: bool,
+                                  metadados: dict,
+                                  wa_doc: dict | None = None):
+    df = df_filtrado if df_filtrado is not None and not df_filtrado.empty else df_base.copy()
+    col_tempo, col_ip = _guess_colunas(df)
+    periodo_txt, achados = _resumo_achados(df, col_tempo, col_ip)
+
+    # hash de conteúdo (SHA-512) — mostrado apenas no FINAL
+    content_payload = _payload_para_hash_conteudo(metadados, wa_doc, df, periodo_txt)
+    content_hash = gerar_hash(content_payload, "sha512")
+
+    png_timeline = _grafico_timeline(df, col_tempo) if incluir_graficos and col_tempo else None
+    png_top_ips = _grafico_top_ips(df, col_ip) if incluir_graficos and col_ip else None
+    tabela_completa = montar_tabela_ip_time_completa(df)
+
+    # -------- HTML --------
+    html_parts = []
+    html_parts.append("<meta charset='utf-8'>")
+    html_parts.append("<style>body{font-family:Arial,Helvetica,sans-serif;margin:24px} h1,h2{margin:0.2em 0} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:6px;font-size:13px} .muted{color:#555} .blk{margin:18px 0}</style>")
+    html_parts.append("<h1>Relatório Policial - Análise de IPs (Análise de Dados)</h1>")
+
+    html_parts.append("<div class='blk'><h2>Metadados</h2><table>")
+    for k,v in metadados.items():
+        html_parts.append(f"<tr><th style='width:260px;text-align:left'>{k}</th><td>{v}</td></tr>")
+    html_parts.append("</table></div>")
+
+    if wa_doc:
+        html_parts.append("<div class='blk'><h2>Dados do Documento WhatsApp Business Record</h2><table>")
+        for k, v in wa_doc.items():
+            html_parts.append(f"<tr><th style='width:260px;text-align:left'>{k}</th><td>{v}</td></tr>")
+        html_parts.append("</table></div>")
+
+    html_parts.append("<div class='blk'><h2>Síntese dos Achados</h2><ul>")
+    for a in achados:
+        html_parts.append(f"<li>{a}</li>")
+    html_parts.append("</ul></div>")
+
+    html_parts.append("<div class='blk'><h2>Metodologia</h2>")
+    html_parts.append("<p class='muted'>Os dados foram importados, higienizados e analisados com apoio de ferramentas computacionais. Procedeu-se à consolidação de múltiplas fontes, conversão de datas para o fuso America/Sao_Paulo e análise descritiva (contagens, modos e médias).</p></div>")
+
+    if incluir_graficos and (png_timeline or png_top_ips):
+        html_parts.append("<div class='blk'><h2>Gráficos</h2>")
+        if png_timeline:
+            html_parts.append("<h3>Linha do tempo de eventos por dia</h3>")
+            html_parts.append(f"<img src='{_png_data_uri(png_timeline)}' style='max-width:100%;height:auto'/>")
+        if png_top_ips:
+            html_parts.append("<h3>Top IPs por frequência</h3>")
+            html_parts.append(f"<img src='{_png_data_uri(png_top_ips)}' style='max-width:100%;height:auto'/>")
+        html_parts.append("</div>")
+
+    html_parts.append("<div class='blk'><h2>Tabela Completa: IP Address × Time (mais recentes primeiro)</h2>")
+    if tabela_completa.empty:
+        html_parts.append("<p class='muted'>Não há dados suficientes para compor a tabela completa (verifique colunas de IP e horário).</p>")
+    else:
+        html_parts.append(tabela_completa.to_html(index=False))
+    html_parts.append("</div>")
+
+    # *** HASH APENAS NO FINAL (sem o texto "(SHA-512)") ***
+    html_parts.append("<div class='blk'><h2>Assinatura Criptográfica</h2>")
+    html_parts.append(f"<p><code>{content_hash}</code></p></div>")
+
+    html_bytes = "\n".join(html_parts).encode("utf-8")
+
+    # -------- TXT --------
+    linhas = []
+    linhas.append("RELATÓRIO POLICIAL (ANÁLISE DE DADOS)")
+    linhas.append("=" * 60)
+    for k,v in metadados.items():
+        linhas.append(f"{k}: {v}")
+
+    if wa_doc:
+        linhas.append("")
+        linhas.append("DADOS DO DOCUMENTO WHATSApp BUSINESS RECORD")
+        for k, v in wa_doc.items():
+            linhas.append(f"- {k}: {v}")
+
+    linhas.append("")
+    linhas.append("1. SÍNTESE DOS ACHADOS")
+    for linha in achados:
+        linhas.append(f"- {linha}")
+
+    linhas.append("")
+    linhas.append("2. METODOLOGIA")
+    linhas.append(textwrap.fill(
+        "Os dados foram importados, higienizados e analisados com apoio de ferramentas "
+        "computacionais. Procedeu-se à consolidação de múltiplas fontes, conversão de datas "
+        "para o fuso America/Sao_Paulo e análise descritiva (contagens, modos e médias).",
+        width=100
+    ))
+
+    linhas.append("")
+    linhas.append("3. TABELA COMPLETA: IP Address × Time (mais recentes primeiro)")
+    if tabela_completa.empty:
+        linhas.append("- Não há dados suficientes para compor a tabela completa.")
+    else:
+        for _, r in tabela_completa.iterrows():
+            linhas.append(f"- {r['Time (America/Sao_Paulo)']}  |  {r['IP Address']}")
+
+    linhas.append("")
+    # *** Sem "(SHA-512)" aqui também ***
+    linhas.append("4. ASSINATURA CRIPTOGRÁFICA")
+    linhas.append(content_hash)
+
+    txt_bytes = "\n".join(linhas).encode("utf-8")
+
+    # -------- DOCX --------
+    docx_bytes = None
+    if DOCX_OK:
+        doc = Document()
+        doc.add_heading('Relatório Policial - Análise de IPs (Análise de Dados)', level=1)
+
+        doc.add_heading('Metadados', level=2)
+        for k,v in metadados.items():
+            doc.add_paragraph(f"{k}: {v}")
+
+        if wa_doc:
+            doc.add_heading('Dados do Documento WhatsApp Business Record', level=2)
+            for k, v in wa_doc.items():
+                doc.add_paragraph(f"{k}: {v}")
+
+        doc.add_heading('Síntese dos Achados', level=2)
+        for a in achados:
+            doc.add_paragraph(a)
+
+        doc.add_heading('Metodologia', level=2)
+        doc.add_paragraph(
+            "Os dados foram importados, higienizados e analisados com apoio de ferramentas computacionais. "
+            "Procedeu-se à consolidação de múltiplas fontes, conversão de datas para o fuso America/Sao_Paulo "
+            "e análise descritiva (contagens, modos e médias)."
+        )
+
+        tabela = montar_tabela_ip_time_completa(df)
+        doc.add_heading('Tabela Completa: IP Address × Time (mais recentes primeiro)', level=2)
+        if tabela.empty:
+            doc.add_paragraph("Não há dados suficientes para compor a tabela completa (verifique colunas de IP e horário).")
+        else:
+            cols = ["Time (America/Sao_Paulo)", "IP Address"]
+            t = doc.add_table(rows=1, cols=len(cols))
+            hdr = t.rows[0].cells
+            for i, c in enumerate(cols):
+                hdr[i].text = c
+            for _, row in tabela.iterrows():
+                cells = t.add_row().cells
+                cells[0].text = str(row["Time (America/Sao_Paulo)"])
+                cells[1].text = str(row["IP Address"])
+
+        # *** HASH APENAS NO FINAL (sem "(SHA-512)") ***
+        doc.add_heading('Assinatura Criptográfica', level=2)
+        doc.add_paragraph(content_hash)
+
+        bio = BytesIO()
+        doc.save(bio); bio.seek(0)
+        docx_bytes = bio.getvalue()
+
+    return {"html": html_bytes, "txt": txt_bytes, "docx": docx_bytes, "content_hash": content_hash}
+
+# ---- PDF: cabeçalho/rodapé; hash só no final do conteúdo ----
+def _header_footer(canvas, doc):
+    largura_pagina, altura_pagina = A4
+    try:
+        logo_path = "brasao.png"
+        if os.path.exists(logo_path):
+            img_w = 40 * mm
+            img_h = 40 * mm
+            x = (largura_pagina - img_w) / 2.0
+            y = altura_pagina - (img_h + 10 * mm)
+            canvas.drawImage(logo_path, x, y, width=img_w, height=img_h,
+                             preserveAspectRatio=True, mask='auto')
+    except Exception:
+        pass
+    page_num = canvas.getPageNumber()
+    canvas.setFont("Helvetica", 9)
+    canvas.setFillColor(colors.grey)
+    canvas.drawRightString(largura_pagina - 20 * mm, 12 * mm, f"Página {page_num}")
+
+def _rl_image_from_png_bytes(png_bytes: bytes, max_width_pt: float, max_height_pt: float):
+    try:
+        bio = BytesIO(png_bytes)
+        ir = ImageReader(bio)
+        iw, ih = ir.getSize()
+        scale = min(max_width_pt / float(iw), max_height_pt / float(ih), 1.0)
+        w = iw * scale
+        h = ih * scale
+        bio.seek(0)
+        return Image(bio, width=w, height=h)
+    except Exception:
+        return None
+
+def gerar_relatorio_pdf(df_base: pd.DataFrame,
+                        df_filtrado: pd.DataFrame,
+                        incluir_graficos: bool,
+                        metadados: dict,
+                        titulo: str = "Relatório Policial - Análise de IPs",
+                        wa_doc: dict | None = None) -> bytes:
+    if not PDF_OK:
+        raise RuntimeError("Pacote 'reportlab' não está disponível. Instale com: pip install reportlab")
+
+    df = df_filtrado if df_filtrado is not None and not df_filtrado.empty else df_base.copy()
+    col_tempo, col_ip = _guess_colunas(df)
+    periodo_txt, achados = _resumo_achados(df, col_tempo, col_ip)
+
+    # Hash do conteúdo (SHA-512) — será adicionado apenas ao final do PDF
+    content_payload = _payload_para_hash_conteudo(metadados, wa_doc, df, periodo_txt)
+    content_hash = gerar_hash(content_payload, "sha512")
 
     styles = getSampleStyleSheet()
-    style_title = styles["Title"]
-    style_h1 = styles["Heading1"]
-    style_body = styles["BodyText"]
+    style_title = styles["Title"]; style_h1 = styles["Heading1"]; style_body = styles["BodyText"]
 
-    # Margens: top = 70mm para reservar 10mm topo + 40mm brasão + 20mm de distância até o título
-    left = right = bottom = 36  # ~12,7 mm
-    top = 70 * mm               # 70 mm
+    left = right = bottom = 36
+    top = 70 * mm
     frame_width = A4[0] - (left + right)
     frame_height = A4[1] - (top + bottom)
 
-    # Conteúdo (sem Spacer)
     story = []
     story.append(Paragraph(titulo, style_title))
 
@@ -572,6 +681,12 @@ def gerar_relatorio_pdf(df_base: pd.DataFrame,
     for k, v in metadados.items():
         story.append(Paragraph(f"{k}: {v}", style_body))
     story.append(Spacer(1, 8))
+
+    if wa_doc:
+        story.append(Paragraph("Dados do Documento WhatsApp Business Record", style_h1))
+        for k, v in wa_doc.items():
+            story.append(Paragraph(f"{k}: {v}", style_body))
+        story.append(Spacer(1, 8))
 
     story.append(Paragraph("1. Síntese dos Achados", style_h1))
     for a in achados:
@@ -581,7 +696,7 @@ def gerar_relatorio_pdf(df_base: pd.DataFrame,
     story.append(Paragraph("2. Metodologia", style_h1))
     story.append(Paragraph(
         "Os dados foram importados, higienizados e analisados com apoio de ferramentas computacionais. "
-        "Procedeu-se à consolidação de múltiplas fontes, conversão de datas para o fuso America/Sao_Paulo "
+        "Procedeu-se à consolidação de múltiplimas fontes, conversão de datas para o fuso America/Sao_Paulo "
         "e análise descritiva (contagens, modos e médias).", style_body
     ))
     story.append(Spacer(1, 8))
@@ -592,25 +707,19 @@ def gerar_relatorio_pdf(df_base: pd.DataFrame,
 
         if png_timeline or png_top_ips:
             story.append(Paragraph("3. Gráficos", style_h1))
-
-            max_w = frame_width
-            max_h = frame_height * 0.45
+            max_w = frame_width; max_h = frame_height * 0.45
 
             if png_timeline:
                 story.append(Paragraph("Linha do tempo de eventos por dia", style_body))
                 img_flow = _rl_image_from_png_bytes(png_timeline, max_w, max_h)
                 if img_flow:
-                    story.append(Spacer(1, 4))
-                    story.append(img_flow)
-                    story.append(Spacer(1, 10))
+                    story.append(Spacer(1, 4)); story.append(img_flow); story.append(Spacer(1, 10))
 
             if png_top_ips:
                 story.append(Paragraph("Top IPs por frequência", style_body))
                 img_flow = _rl_image_from_png_bytes(png_top_ips, max_w, max_h)
                 if img_flow:
-                    story.append(Spacer(1, 4))
-                    story.append(img_flow)
-                    story.append(Spacer(1, 10))
+                    story.append(Spacer(1, 4)); story.append(img_flow); story.append(Spacer(1, 10))
 
     story.append(Paragraph("4. Tabela Completa: IP Address × Time (mais recentes primeiro)", style_h1))
     tabela_full = montar_tabela_ip_time_completa(df)
@@ -631,15 +740,58 @@ def gerar_relatorio_pdf(df_base: pd.DataFrame,
         ]))
         story.append(tbl)
 
+    # *** HASH APENAS NO FINAL (sem "(SHA-512)") ***
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("5. Assinatura Criptográfica", style_h1))
+    story.append(Paragraph(f"<font name='Courier'>{content_hash}</font>", style_body))
+
     bio = BytesIO()
     doc = SimpleDocTemplate(
-        bio,
-        pagesize=A4,
+        bio, pagesize=A4,
         leftMargin=left, rightMargin=right,
         topMargin=top, bottomMargin=bottom,
         title=titulo
     )
     doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    return bio.getvalue()
+
+# ---------- NOVO: PDF SÓ DO HASH PARA COMPARAÇÃO ----------
+def gerar_pdf_hash(hash_str: str,
+                   metadados: dict | None = None,
+                   titulo: str = "Assinatura Criptográfica para Verificação") -> bytes:
+    """
+    Gera um PDF minimalista contendo apenas a assinatura criptográfica (hash),
+    opcionalmente com alguns metadados essenciais para facilitar a comparação.
+    """
+    if not PDF_OK:
+        raise RuntimeError("Pacote 'reportlab' não está disponível. Instale com: pip install reportlab")
+
+    styles = getSampleStyleSheet()
+    style_title = styles["Title"]; style_h1 = styles["Heading1"]; style_body = styles["BodyText"]
+
+    left = right = bottom = 36
+    top = 36
+
+    story = []
+    story.append(Paragraph(titulo, style_title))
+    story.append(Spacer(1, 8))
+    if metadados:
+        story.append(Paragraph("Metadados essenciais", style_h1))
+        for k, v in metadados.items():
+            story.append(Paragraph(f"{k}: {v}", style_body))
+        story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Hash (SHA-512)", style_h1))
+    story.append(Paragraph(f"<font name='Courier'>{hash_str}</font>", style_body))
+
+    bio = BytesIO()
+    doc = SimpleDocTemplate(
+        bio, pagesize=A4,
+        leftMargin=left, rightMargin=right,
+        topMargin=top, bottomMargin=bottom,
+        title="Assinatura Criptográfica"
+    )
+    doc.build(story)
     return bio.getvalue()
 
 # =============================
@@ -676,6 +828,8 @@ if uploaded_files:
             st.subheader("Visualização dos Dados Combinados")
             df = detectar_colunas_datetime(df)
             st.dataframe(formatar_datas_para_exibicao(df))
+            if st.session_state.get("wa_doc"):
+                st.success("WhatsApp Business Record detectado. Ele será incluído no relatório (texto saneado).")
 
         with aba2:
             st.subheader("Filtrar Dados")
@@ -811,7 +965,7 @@ if uploaded_files:
             st.download_button("Baixar em JSON", data=json_bytes, file_name="dados_filtrados.json", mime="application/json")
 
         with aba8:
-            st.subheader("📝 Gerar Relatório Policial (sem Anexo de Amostra)")
+            st.subheader("📝 Gerar Relatório Policial (hash no final)")
             with st.form("form_relatorio"):
                 colA, colB = st.columns(2)
                 with colA:
@@ -844,10 +998,11 @@ if uploaded_files:
                     df_base=df,
                     df_filtrado=df_filtrado if 'df_filtrado' in locals() else None,
                     incluir_graficos=incluir_graficos,
-                    metadados=metadados
+                    metadados=metadados,
+                    wa_doc=st.session_state.get("wa_doc")
                 )
 
-                st.success("Relatório gerado! Baixe nos botões abaixo.")
+                st.success("Relatórios gerados! Baixe nos botões abaixo.")
                 if pacotes.get("docx"):
                     st.download_button(
                         "Baixar Relatório (DOCX)",
@@ -868,6 +1023,7 @@ if uploaded_files:
                     mime="text/plain"
                 )
 
+                # PDF principal do relatório
                 if not PDF_OK:
                     st.error("Para PDF, instale o pacote: pip install reportlab")
                 else:
@@ -877,7 +1033,8 @@ if uploaded_files:
                             df_filtrado=df_filtrado if 'df_filtrado' in locals() else None,
                             incluir_graficos=incluir_graficos,
                             metadados=metadados,
-                            titulo="Relatório Policial - Análise de IPs"
+                            titulo="Relatório Policial - Análise de IPs",
+                            wa_doc=st.session_state.get("wa_doc")
                         )
                         st.download_button(
                             "Baixar Relatório (PDF)",
@@ -886,9 +1043,26 @@ if uploaded_files:
                             mime="application/pdf"
                         )
                     except Exception as e:
-                        st.error(f"Falha ao gerar PDF: {e}")
+                        st.error(f"Falha ao gerar PDF do relatório: {e}")
+
+                # -------- NOVO BOTÃO: PDF contendo apenas o HASH para comparação --------
+                try:
+                    hash_pdf = gerar_pdf_hash(
+                        hash_str=pacotes["content_hash"],
+                        metadados={
+                            "Nº do Procedimento/BO": metadados.get("Nº do Procedimento/BO", ""),
+                            "Data/Hora de Geração": metadados.get("Data/Hora de Geração", ""),
+                            "Local/Timezone": metadados.get("Local/Timezone", "")
+                        }
+                    )
+                    st.download_button(
+                        "Baixar Hash (PDF para comparação)",
+                        data=hash_pdf,
+                        file_name="assinatura_criptografica.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"Falha ao gerar PDF do hash: {e}")
 
     else:
         st.warning("Nenhum dado válido encontrado.")
-
-
